@@ -521,7 +521,7 @@ impl KaspaClient {
             password: self.password.clone(),
             ..Default::default()
         };
-        KaspaEventListener::new(config)
+        KaspaEventListener::from_config(config)
     }
 }
 
