@@ -2,7 +2,7 @@ pub mod batch;
 pub mod config;
 pub mod dag;
 pub mod events;
-pub mod mempool;
+pub mod mem;
 pub mod monitor;
 pub mod tool;
 pub mod types;
