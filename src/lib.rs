@@ -3,7 +3,6 @@ pub mod config;
 pub mod dag;
 pub mod events;
 pub mod mempool;
-pub mod miner;
 pub mod monitor;
 pub mod tool;
 pub mod types;
