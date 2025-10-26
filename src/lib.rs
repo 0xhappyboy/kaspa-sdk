@@ -5,7 +5,6 @@ pub mod events;
 pub mod mempool;
 pub mod miner;
 pub mod monitor;
-pub mod subnetwork;
 pub mod tool;
 pub mod types;
 pub mod wallet;
@@ -20,8 +19,17 @@ use crate::types::{
 };
 use reqwest::{Client, Response};
 use serde::de::DeserializeOwned;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+pub struct NetWorkStatistics {
+    pub daily_transactions: u64,
+    pub average_block_size: f64,
+    pub network_growth: f64,
+    pub active_addresses: usize,
+    pub transaction_volume: u64,
+}
 
 /// kaspa client
 pub struct KaspaClient {
@@ -107,6 +115,137 @@ impl KaspaClient {
         rpc_response.result.ok_or_else(|| {
             KaspaError::InvalidResponse("Missing result in RPC response".to_string())
         })
+    }
+
+    /// get network statistics
+    pub async fn get_network_statistics(&self, days: u64) -> Result<NetWorkStatistics> {
+        let current_block_count = self.get_block_count().await?;
+        let start_block = current_block_count.saturating_sub(days * 144); // 假设每天144个区块
+        let mut total_transactions = 0;
+        let mut total_block_size = 0;
+        let mut active_addresses = HashSet::new();
+        let mut total_volume = 0;
+        for block_num in start_block..=current_block_count {
+            if let Ok(block) = self.get_block_by_number(block_num).await {
+                total_transactions += block.transactions.len();
+                for tx in &block.transactions {
+                    self.analyze_transaction_addresses(tx, &mut active_addresses);
+                    total_volume += self.cal_transaction_volume(tx);
+                }
+            }
+        }
+        let block_count = (current_block_count - start_block) as f64;
+        let average_block_size = total_block_size as f64 / block_count.max(1.0);
+        Ok(NetWorkStatistics {
+            daily_transactions: total_transactions as u64 / days,
+            average_block_size,
+            network_growth: self.cal_network_growth().await?,
+            active_addresses: active_addresses.len(),
+            transaction_volume: total_volume,
+        })
+    }
+
+    /// get block info by number
+    async fn get_block_by_number(&self, block_number: u64) -> Result<Block> {
+        let blocks = self.get_blocks("", false, true).await?;
+        blocks
+            .first()
+            .cloned()
+            .ok_or_else(|| KaspaError::Custom(format!("Block number {} not found", block_number)))
+    }
+
+    /// analyze transaction addresses
+    fn analyze_transaction_addresses(
+        &self,
+        transaction: &Transaction,
+        active_addresses: &mut HashSet<String>,
+    ) -> HashSet<String> {
+        for output in &transaction.outputs {
+            if let Some(verbose_data) = &output.verbose_data {
+                active_addresses.insert(verbose_data.script_public_key_address.clone());
+            }
+        }
+        active_addresses.clone()
+    }
+
+    /// Calculate the total value of all transactions in a transaction.
+    pub fn cal_transaction_volume(&self, transaction: &Transaction) -> u64 {
+        transaction.outputs.iter().map(|output| output.value).sum()
+    }
+
+    /// calculate network growth
+    pub async fn cal_network_growth(&self) -> Result<f64> {
+        // Get current block information
+        let current_info = self.get_info().await?;
+        let current_block_count = current_info.block_count;
+        // Get block information from 24 hours ago (estimated by virtual chain changes)
+        let virtual_chain = self.get_virtual_chain_from_block("", false).await?;
+        // Calculate block growth within 24 hours
+        let blocks_24h = if let Some(added_blocks) = virtual_chain.get("addedChainBlockHashes") {
+            added_blocks.as_array().map(|arr| arr.len()).unwrap_or(0)
+        } else {
+            let avg_block_time = 1.0; // Kaspa average block time (seconds)
+            let estimated_24h_blocks = (24 * 60 * 60) as f64 / avg_block_time;
+            estimated_24h_blocks as usize
+        };
+        let growth_rate = if current_block_count > 0 {
+            (blocks_24h as f64) / (current_block_count as f64) * 100.0
+        } else {
+            0.0
+        };
+        Ok(growth_rate)
+    }
+
+    /// Address cluster analysis.
+    /// Used to identify related addresses belonging to the same user or entity.
+    /// Analyze all transactions in the most recent `depth` blocks.
+    /// For each transaction, collect all output addresses and cluster together multiple addresses that appear in the same transaction.
+    ///
+    /// # Example
+    /// ```rust
+    /// let client = KaspaClient::new("http://localhost:16110");
+    /// let clusters = client.analyze_address_clusters(500).await?;
+    /// let mixing_patterns: Vec<_> = clusters
+    /// .iter()
+    /// .filter(|(_, addresses)| {
+    ///      // Detection characteristics
+    ///       addresses.len() > 20
+    /// }).collect();
+    /// ```
+    pub async fn analyze_address_clusters(
+        &self,
+        depth: u64,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let mut clusters: HashMap<String, Vec<String>> = HashMap::new();
+        let mut visited_addresses = HashSet::new();
+        let blocks = self.get_blocks("", false, true).await?;
+        let total_blocks = blocks.len();
+        let start_index = total_blocks.saturating_sub(depth as usize);
+        for i in start_index..total_blocks {
+            if let Some(block) = blocks.get(i) {
+                for tx in &block.transactions {
+                    let mut addresses_in_tx = HashSet::new();
+                    for output in &tx.outputs {
+                        if let Some(verbose_data) = &output.verbose_data {
+                            addresses_in_tx.insert(verbose_data.script_public_key_address.clone());
+                        }
+                    }
+                    if addresses_in_tx.len() > 1 {
+                        let addresses: Vec<String> = addresses_in_tx.into_iter().collect();
+                        let cluster_key = addresses[0].clone();
+                        let cluster = clusters.entry(cluster_key).or_insert_with(Vec::new);
+                        for address in addresses {
+                            if !cluster.contains(&address) && !visited_addresses.contains(&address)
+                            {
+                                cluster.push(address.clone());
+                                visited_addresses.insert(address);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(clusters)
     }
 
     /// get block
